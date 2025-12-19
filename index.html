@@ -1,764 +1,634 @@
-#include <stdio.h>
-#include <stdlib.h>
-#include <stdint.h>
-#include <string.h>
-
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
-
-#include "esp_log.h"
-#include "esp_err.h"
-
-#include "nvs_flash.h"
-#include "esp_netif.h"
-#include "esp_event.h"
-#include "esp_wifi.h"
-#include "esp_http_server.h"
-#include "esp_http_client.h"
-#include "esp_crt_bundle.h"
-#include "cJSON.h"
-
-#include "led_strip.h"
-
-static const char *TAG = "WS2812_WEB";
-
-// ===================== WIFI CONFIG =====================
-#define WIFI_SSID "xin_ban_hanh"
-#define WIFI_PASS "SV2_1234567890"
-
-// ===================== FIREBASE RTDB =====================
-#define FIREBASE_URL "https://ledck-66e93-default-rtdb.asia-southeast1.firebasedatabase.app/devices/esp32_01/state.json"
-#define FIREBASE_POLL_MS 1000
-
-
-// ===================== LED CONFIG ======================
-#define WS2812_GPIO    8
-#define WS2812_LED_NUM (64 + 32)     // ✅ 96 LED
-
-static led_strip_handle_t strip;
-
-// ===================== APP STATE =======================
-typedef enum {
-    MODE_OFF = 0,
-    MODE_LAYERS_PROGRESSIVE_WHITE = 1,
-    MODE_LAYERS_ONE_BY_ONE_GREEN = 2,
-    MODE_LAYERS_ONE_BY_ONE_MULTICOLOR = 3,
-    MODE_LAYERS_SOLO_THEN_ACCUM = 4,
-    MODE_ALL_COLOR_CYCLE = 5,
-
-} effect_mode_t;
-
-static volatile effect_mode_t g_mode = MODE_LAYERS_PROGRESSIVE_WHITE;
-static volatile uint8_t g_brightness = 80;   // 0..255 (mặc định 80 để đỡ tốn nguồn)
-static volatile int g_speed_ms = 30;
-static TaskHandle_t g_effect_task = NULL;
-static TaskHandle_t g_firebase_task = NULL;
-// ===================== PROTOTYPES ======================
-static void firebase_poll_task(void *arg);
-
-static inline uint8_t scale_bri(uint8_t x);
-static inline void set_pixel(int idx, uint8_t r, uint8_t g, uint8_t b);
-static void clear_show(void);
-static void set_all(uint8_t r, uint8_t g, uint8_t b);
-
-static void set_range_1based(int a, int b, uint8_t r, uint8_t g, uint8_t bl);
-static void mark_range_1based(uint8_t *used, int a, int b);
-
-static void effect_layers_progressive(uint8_t r, uint8_t g, uint8_t bl,
-                                      int on_ms_each_layer, int off_ms_between);
-
-static void effect_layers_one_by_one(uint8_t r, uint8_t g, uint8_t bl,
-                                     int on_ms, int off_ms);
-
-static void effect_layers_one_by_one_multicolor(
-    uint8_t r1, uint8_t g1, uint8_t b1,
-    uint8_t r2, uint8_t g2, uint8_t b2,
-    uint8_t r3, uint8_t g3, uint8_t b3,
-    uint8_t r4, uint8_t g4, uint8_t b4,
-    int on_ms, int off_ms);
-
-static void effect_layers_solo_then_accumulate(
-    uint8_t r1, uint8_t g1, uint8_t b1,
-    uint8_t r2, uint8_t g2, uint8_t b2,
-    uint8_t r3, uint8_t g3, uint8_t b3,
-    uint8_t r4, uint8_t g4, uint8_t b4,
-    int solo_on_ms, int solo_off_ms,
-    int acc_on_ms, int acc_gap_ms);
-
-// ===================== LED HELPERS ======================
-static inline uint8_t scale_bri(uint8_t x)
-{
-    // scale theo brightness toàn cục
-    return (uint16_t)x * g_brightness / 255;
-}
-
-static inline void set_pixel(int idx, uint8_t r, uint8_t g, uint8_t b)
-{
-    if (idx >= 0 && idx < WS2812_LED_NUM) {
-        led_strip_set_pixel(strip, idx, scale_bri(r), scale_bri(g), scale_bri(b));
+<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>ESP32 Firebase LED Control</title>
+  <style>
+    :root{
+      --bg:#0b1020;
+      --card:#121a33;
+      --card2:#0f1730;
+      --text:#eaf0ff;
+      --muted:#aab6da;
+      --line:rgba(255,255,255,.12);
+      --btn:#3b82f6;
+      --btn2:#2563eb;
+      --ok:#22c55e;
+      --warn:#f59e0b;
+      --bad:#ef4444;
+      --shadow: 0 18px 60px rgba(0,0,0,.45);
+      --r: 18px;
     }
-}
-
-static void clear_show(void)
-{
-    led_strip_clear(strip);
-    led_strip_refresh(strip);
-}
-
-static void set_all(uint8_t r, uint8_t g, uint8_t b)
-{
-    for (int i = 0; i < WS2812_LED_NUM; i++) {
-        set_pixel(i, r, g, b);
+    *{box-sizing:border-box}
+    body{
+      margin:0;
+      font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial;
+      background:
+        radial-gradient(1200px 600px at 10% 0%, rgba(59,130,246,.35), transparent 60%),
+        radial-gradient(900px 500px at 100% 20%, rgba(34,197,94,.25), transparent 55%),
+        radial-gradient(900px 500px at 50% 100%, rgba(245,158,11,.20), transparent 55%),
+        var(--bg);
+      color:var(--text);
+      min-height:100vh;
+      display:flex;
+      align-items:center;
+      justify-content:center;
+      padding:22px;
     }
-    led_strip_refresh(strip);
-}
-static void hsv2rgb(uint16_t h, uint8_t s, uint8_t v, uint8_t *r, uint8_t *g, uint8_t *b)
-{
-    uint8_t region = h / 60;
-    uint16_t remainder = (h - (region * 60)) * 255 / 60;
+    .wrap{width:min(720px, 100%);}
 
-    uint8_t p = (uint16_t)v * (255 - s) / 255;
-    uint8_t q = (uint16_t)v * (255 - ((uint16_t)s * remainder / 255)) / 255;
-    uint8_t t = (uint16_t)v * (255 - ((uint16_t)s * (255 - remainder) / 255)) / 255;
-
-    switch (region) {
-        case 0: *r = v; *g = t; *b = p; break;
-        case 1: *r = q; *g = v; *b = p; break;
-        case 2: *r = p; *g = v; *b = t; break;
-        case 3: *r = p; *g = q; *b = v; break;
-        case 4: *r = t; *g = p; *b = v; break;
-        default:*r = v; *g = p; *b = q; break;
+    .top{
+      display:flex; gap:14px; align-items:center; justify-content:space-between;
+      margin-bottom:14px;
     }
-}
-
-// Hiệu ứng: sáng toàn bộ và đổi màu liên tục
-static void effect_all_color_cycle(void)
-{
-    static uint16_t hue = 0;   // giữ trạng thái giữa các vòng lặp
-    uint8_t r, g, b;
-
-    hsv2rgb(hue, 255, 255, &r, &g, &b);
-    set_all(r, g, b);
-
-    hue = (hue + 3) % 360;     // tốc độ đổi màu (tăng lên = nhanh hơn)
-    vTaskDelay(pdMS_TO_TICKS(g_speed_ms));
-}
-
-// set range theo chỉ số LED 1-based (hỗ trợ cả giảm dần)
-static void set_range_1based(int a, int b, uint8_t r, uint8_t g, uint8_t bl)
-{
-    int n = WS2812_LED_NUM;
-
-    if (a < 1) a = 1;
-    if (a > n) a = n;
-    if (b < 1) b = 1;
-    if (b > n) b = n;
-
-    if (a <= b) {
-        for (int i = a; i <= b; i++) set_pixel(i - 1, r, g, bl);
-    } else {
-        for (int i = a; i >= b; i--) set_pixel(i - 1, r, g, bl);
+    .brand{display:flex; gap:12px; align-items:center;}
+    .logo{
+      width:44px;height:44px;border-radius:14px;
+      background: linear-gradient(135deg, rgba(59,130,246,1), rgba(34,197,94,1));
+      box-shadow: var(--shadow);
+      position:relative; overflow:hidden;
     }
-}
-
-// mark range để tính "tầng cuối là led còn lại"
-static void mark_range_1based(uint8_t *used, int a, int b)
-{
-    int n = WS2812_LED_NUM;
-
-    if (a < 1) a = 1;
-    if (a > n) a = n;
-    if (b < 1) b = 1;
-    if (b > n) b = n;
-
-    if (a <= b) {
-        for (int i = a; i <= b; i++) used[i] = 1;
-    } else {
-        for (int i = a; i >= b; i--) used[i] = 1;
+    .logo:after{
+      content:"";
+      position:absolute; inset:-30px;
+      background: radial-gradient(circle at 30% 30%, rgba(255,255,255,.35), transparent 60%);
+      transform: rotate(25deg);
     }
-}
+    h1{font-size:18px; margin:0; letter-spacing:.2px;}
+    .sub{color:var(--muted); font-size:13px; margin-top:2px}
 
-// ===================== EFFECTS (GIỮ NGUYÊN LOGIC) ======================
-// Mapping tầng theo code bạn đang dùng:
-// T1: 1..24 và 70..63
-// T2: 25..40 và 78..71
-// T3: 41..51 và 86..79
-// Tầng cuối: còn lại
-
-static void effect_layers_progressive(uint8_t r, uint8_t g, uint8_t bl,
-                                      int on_ms_each_layer, int off_ms_between)
-{
-    int n = WS2812_LED_NUM;
-    uint8_t *used = (uint8_t *)calloc(n + 1, 1);
-    if (!used) return;
-
-    mark_range_1based(used, 1, 24);
-    mark_range_1based(used, 70, 63);
-
-    mark_range_1based(used, 25, 40);
-    mark_range_1based(used, 78, 71);
-
-    mark_range_1based(used, 41, 51);
-    mark_range_1based(used, 86, 79);
-
-    led_strip_clear(strip);
-
-    // Tầng 1
-    set_range_1based(1, 24, r, g, bl);
-    set_range_1based(70, 63, r, g, bl);
-    led_strip_refresh(strip);
-    vTaskDelay(pdMS_TO_TICKS(on_ms_each_layer));
-    if (off_ms_between > 0) vTaskDelay(pdMS_TO_TICKS(off_ms_between));
-
-    // Tầng 2
-    set_range_1based(25, 40, r, g, bl);
-    set_range_1based(78, 71, r, g, bl);
-    led_strip_refresh(strip);
-    vTaskDelay(pdMS_TO_TICKS(on_ms_each_layer));
-    if (off_ms_between > 0) vTaskDelay(pdMS_TO_TICKS(off_ms_between));
-
-    // Tầng 3
-    set_range_1based(41, 51, r, g, bl);
-    set_range_1based(86, 79, r, g, bl);
-    led_strip_refresh(strip);
-    vTaskDelay(pdMS_TO_TICKS(on_ms_each_layer));
-    if (off_ms_between > 0) vTaskDelay(pdMS_TO_TICKS(off_ms_between));
-
-    // Tầng cuối
-    for (int i = 1; i <= n; i++) {
-        if (!used[i]) set_pixel(i - 1, r, g, bl);
+    .badge{
+      display:inline-flex; align-items:center; gap:8px;
+      padding:8px 10px; border-radius:999px;
+      border:1px solid var(--line);
+      background: rgba(255,255,255,.06);
+      font-size:12px;
+      color:var(--muted);
+      white-space:nowrap;
     }
-    led_strip_refresh(strip);
-    vTaskDelay(pdMS_TO_TICKS(on_ms_each_layer));
+    .dot{
+      width:10px;height:10px;border-radius:50%;
+      background: var(--warn);
+      box-shadow: 0 0 0 6px rgba(245,158,11,.14);
+    }
+    .dot.ok{background:var(--ok); box-shadow: 0 0 0 6px rgba(34,197,94,.12);}
+    .dot.bad{background:var(--bad); box-shadow: 0 0 0 6px rgba(239,68,68,.12);}
 
-    free(used);
-}
+    .card{
+      background: linear-gradient(180deg, rgba(255,255,255,.06), rgba(255,255,255,.03));
+      border:1px solid var(--line);
+      border-radius: var(--r);
+      box-shadow: var(--shadow);
+      overflow:hidden;
+    }
+    .grid{
+      display:grid;
+      grid-template-columns: 1fr 1fr;
+      gap:14px;
+      padding:16px;
+    }
+    @media (max-width: 640px){
+      .grid{grid-template-columns:1fr}
+    }
+    .section{
+      background: rgba(0,0,0,.18);
+      border:1px solid var(--line);
+      border-radius: 16px;
+      padding:14px;
+    }
+    .title{
+      display:flex; align-items:center; justify-content:space-between;
+      margin-bottom:10px;
+    }
+    .title b{font-size:14px}
+    .hint{color:var(--muted); font-size:12px}
+    .row{display:flex; gap:10px; align-items:center}
+    select, button, input[type="range"]{width:100%;}
+    select{
+      background: var(--card2);
+      color: var(--text);
+      border:1px solid var(--line);
+      padding:12px 12px;
+      border-radius: 14px;
+      font-size:15px;
+      outline:none;
+    }
+    input[type="range"]{
+      appearance:none;
+      height:10px;
+      border-radius:999px;
+      background: rgba(255,255,255,.12);
+      outline:none;
+    }
+    input[type="range"]::-webkit-slider-thumb{
+      appearance:none;
+      width:18px;height:18px;border-radius:50%;
+      background: var(--btn);
+      border:2px solid rgba(255,255,255,.35);
+      box-shadow: 0 8px 22px rgba(0,0,0,.35);
+    }
+    .value{
+      min-width:58px;
+      text-align:right;
+      font-variant-numeric: tabular-nums;
+      color: var(--text);
+      font-weight:700;
+    }
+    .actions{
+      padding:16px;
+      border-top:1px solid var(--line);
+      display:flex;
+      gap:12px;
+      align-items:center;
+      justify-content:space-between;
+      background: rgba(0,0,0,.14);
+      flex-wrap:wrap;
+    }
+    .btn{
+      flex:1;
+      min-width: 220px;
+      border:none;
+      border-radius: 16px;
+      padding:12px 14px;
+      font-size:15px;
+      font-weight:800;
+      color:white;
+      background: linear-gradient(135deg, var(--btn), var(--btn2));
+      cursor:pointer;
+      box-shadow: 0 18px 40px rgba(37,99,235,.28);
+      transition: transform .08s ease;
+    }
+    .btn:active{transform: translateY(1px)}
+    .btn.voice{
+      background: linear-gradient(135deg, #22c55e, #16a34a);
+      box-shadow: 0 18px 40px rgba(34,197,94,.20);
+    }
+    .mini{
+      display:flex; gap:10px; align-items:center;
+      color: var(--muted);
+      font-size:12px;
+      flex:1;
+      justify-content:flex-end;
+      min-width: 240px;
+    }
+    code{
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 11px;
+      padding:4px 8px;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: rgba(255,255,255,.06);
+      color: var(--text);
+    }
+    .toast{
+      margin-top:12px;
+      padding:10px 12px;
+      border-radius: 14px;
+      border:1px solid var(--line);
+      background: rgba(255,255,255,.06);
+      color: var(--muted);
+      font-size:12px;
+      line-height: 1.35;
+    }
+    .colorBox{
+      width: 44px;
+      height: 44px;
+      border-radius: 14px;
+      border: 1px solid var(--line);
+      background: var(--card2);
+      overflow:hidden;
+      flex: 0 0 auto;
+    }
+    input[type="color"]{
+      width: 100%;
+      height: 100%;
+      border: 0;
+      padding: 0;
+      background: transparent;
+      cursor: pointer;
+    }
+  </style>
+</head>
 
-static void effect_layers_one_by_one(uint8_t r, uint8_t g, uint8_t bl,
-                                     int on_ms, int off_ms)
-{
-    int n = WS2812_LED_NUM;
-    uint8_t *used = (uint8_t *)calloc(n + 1, 1);
-    if (!used) return;
+<body>
+  <div class="wrap">
+    <div class="top">
+      <div class="brand">
+        <div class="logo"></div>
+        <div>
+          <h1>ESP32 WS2812 • Firebase Control</h1>
+          <div class="sub">Điều khiển LED từ mọi nơi (Firebase RTDB)</div>
+        </div>
+      </div>
+      <div class="badge" id="statusBadge">
+        <span class="dot" id="statusDot"></span>
+        <span id="statusText">Đang kết nối Firebase…</span>
+      </div>
+    </div>
 
-    mark_range_1based(used, 1, 24);
-    mark_range_1based(used, 70, 63);
-    mark_range_1based(used, 25, 40);
-    mark_range_1based(used, 78, 71);
-    mark_range_1based(used, 41, 51);
-    mark_range_1based(used, 86, 79);
+    <div class="card">
+      <div class="grid">
+        <div class="section">
+          <div class="title">
+            <b>Hiệu ứng</b>
+            <span class="hint">Mode</span>
+          </div>
 
-    // T1
-    led_strip_clear(strip);
-    set_range_1based(1, 24, r, g, bl);
-    set_range_1based(70, 63, r, g, bl);
-    led_strip_refresh(strip);
-    vTaskDelay(pdMS_TO_TICKS(on_ms));
-    clear_show();
-    vTaskDelay(pdMS_TO_TICKS(off_ms));
+          <select id="mode">
+            <option value="0">OFF</option>
+            <option value="1">Layers Progressive (White)</option>
+            <option value="2">Layers One by One (Green)</option>
+            <option value="3">Layers One by One (MultiColor)</option>
+            <option value="4">Layers Solo then Accumulate</option>
+            <option value="5">All LEDs Color Cycle</option>
+            <option value="6">Mode 6: 4 LEDs Fade Blink</option>
+            <option value="7">Mode 7: All Breathing (Fade In/Out)</option>
+          </select>
 
-    // T2
-    led_strip_clear(strip);
-    set_range_1based(25, 40, r, g, bl);
-    set_range_1based(78, 71, r, g, bl);
-    led_strip_refresh(strip);
-    vTaskDelay(pdMS_TO_TICKS(on_ms));
-    clear_show();
-    vTaskDelay(pdMS_TO_TICKS(off_ms));
+          <div class="toast" style="margin-top:12px">
+            Path điều khiển: <code>devices/esp32_01/state</code><br>
+            Voice: “chế độ 7”, “độ sáng 120”, “tốc độ 30”, “màu đỏ”, “màu #00ff88”, “tắt”.
+          </div>
+        </div>
 
-    // T3
-    led_strip_clear(strip);
-    set_range_1based(41, 51, r, g, bl);
-    set_range_1based(86, 79, r, g, bl);
-    led_strip_refresh(strip);
-    vTaskDelay(pdMS_TO_TICKS(on_ms));
-    clear_show();
-    vTaskDelay(pdMS_TO_TICKS(off_ms));
+        <div class="section">
+          <div class="title">
+            <b>Độ sáng</b>
+            <span class="hint">0 → 255</span>
+          </div>
+          <div class="row">
+            <input id="brightness" type="range" min="0" max="255" value="80">
+            <div class="value" id="brightnessVal">80</div>
+          </div>
 
-    // T cuối
-    led_strip_clear(strip);
-    for (int i = 1; i <= n; i++) if (!used[i]) set_pixel(i - 1, r, g, bl);
-    led_strip_refresh(strip);
-    vTaskDelay(pdMS_TO_TICKS(on_ms));
-    clear_show();
-    vTaskDelay(pdMS_TO_TICKS(off_ms));
+          <div class="title" style="margin-top:14px">
+            <b>Tốc độ</b>
+            <span class="hint">ms/step</span>
+          </div>
+          <div class="row">
+            <input id="speed" type="range" min="10" max="200" value="30">
+            <div class="value" id="speedVal">30</div>
+          </div>
 
-    free(used);
-}
+          <div class="title" style="margin-top:14px">
+            <b>Màu (Mode 7)</b>
+            <span class="hint">Color</span>
+          </div>
+          <div class="row">
+            <div class="colorBox">
+              <input id="color" type="color" value="#0000ff" aria-label="color picker">
+            </div>
+            <div class="value" id="colorVal">#0000ff</div>
+          </div>
 
-static void effect_layers_one_by_one_multicolor(
-    uint8_t r1, uint8_t g1, uint8_t b1,
-    uint8_t r2, uint8_t g2, uint8_t b2,
-    uint8_t r3, uint8_t g3, uint8_t b3,
-    uint8_t r4, uint8_t g4, uint8_t b4,
-    int on_ms, int off_ms)
-{
-    int n = WS2812_LED_NUM;
-    uint8_t *used = (uint8_t *)calloc(n + 1, 1);
-    if (!used) return;
+          <div class="toast" id="toast">Mẹo: Speed ảnh hưởng mạnh nhất với “Color Cycle”. Mode 7 sẽ “thở” theo màu bạn chọn.</div>
+        </div>
+      </div>
 
-    mark_range_1based(used, 1, 24);
-    mark_range_1based(used, 70, 63);
-    mark_range_1based(used, 25, 40);
-    mark_range_1based(used, 78, 71);
-    mark_range_1based(used, 41, 51);
-    mark_range_1based(used, 86, 79);
+      <div class="actions">
+        <button class="btn voice" id="voiceBtn">🎙 NÓI ĐỂ ĐIỀU KHIỂN</button>
+        <button class="btn" id="applyBtn">APPLY → Firebase</button>
+        <div class="mini">
+          <span>Trạng thái:</span>
+          <code id="lastWrite">chưa gửi</code>
+        </div>
+      </div>
+    </div>
+  </div>
 
-    // T1
-    led_strip_clear(strip);
-    set_range_1based(1, 24, r1, g1, b1);
-    set_range_1based(70, 63, r1, g1, b1);
-    led_strip_refresh(strip);
-    vTaskDelay(pdMS_TO_TICKS(on_ms));
-    clear_show();
-    vTaskDelay(pdMS_TO_TICKS(off_ms));
+  <!-- Firebase SDK (compat) -->
+  <script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-app-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-auth-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-database-compat.js"></script>
 
-    // T2
-    led_strip_clear(strip);
-    set_range_1based(25, 40, r2, g2, b2);
-    set_range_1based(78, 71, r2, g2, b2);
-    led_strip_refresh(strip);
-    vTaskDelay(pdMS_TO_TICKS(on_ms));
-    clear_show();
-    vTaskDelay(pdMS_TO_TICKS(off_ms));
+  <script>
+    // ====== Config của bạn ======
+    const firebaseConfig = {
+      apiKey: "AIzaSyC7a8n72fv2IYXa0mCW8AVT1uySlDJ_fTg",
+      authDomain: "ledck-66e93.firebaseapp.com",
+      databaseURL: "https://ledck-66e93-default-rtdb.asia-southeast1.firebasedatabase.app",
+      projectId: "ledck-66e93",
+      storageBucket: "ledck-66e93.firebasestorage.app",
+      messagingSenderId: "374250268282",
+      appId: "1:374250268282:web:ff7f5d48745b692d4c3dc3",
+      measurementId: "G-Z9DZMK5LGR"
+    };
 
-    // T3
-    led_strip_clear(strip);
-    set_range_1based(41, 51, r3, g3, b3);
-    set_range_1based(86, 79, r3, g3, b3);
-    led_strip_refresh(strip);
-    vTaskDelay(pdMS_TO_TICKS(on_ms));
-    clear_show();
-    vTaskDelay(pdMS_TO_TICKS(off_ms));
+    // ====== UI helpers ======
+    const $ = (id) => document.getElementById(id);
+    const statusDot = $("statusDot");
+    const statusText = $("statusText");
+    const toast = $("toast");
+    const lastWrite = $("lastWrite");
+    const applyBtn = $("applyBtn");
+    const voiceBtn = $("voiceBtn");
 
-    // T cuối
-    led_strip_clear(strip);
-    for (int i = 1; i <= n; i++) if (!used[i]) set_pixel(i - 1, r4, g4, b4);
-    led_strip_refresh(strip);
-    vTaskDelay(pdMS_TO_TICKS(on_ms));
-    clear_show();
-    vTaskDelay(pdMS_TO_TICKS(off_ms));
+    function setStatus(kind, text){
+      statusText.textContent = text;
+      statusDot.classList.remove("ok","bad");
+      if(kind === "ok") statusDot.classList.add("ok");
+      else if(kind === "bad") statusDot.classList.add("bad");
+      // warn = default
+    }
 
-    free(used);
-}
+    function nowStr(){
+      const d = new Date();
+      return d.toLocaleTimeString();
+    }
 
-static void effect_layers_solo_then_accumulate(
-    uint8_t r1, uint8_t g1, uint8_t b1,
-    uint8_t r2, uint8_t g2, uint8_t b2,
-    uint8_t r3, uint8_t g3, uint8_t b3,
-    uint8_t r4, uint8_t g4, uint8_t b4,
-    int solo_on_ms, int solo_off_ms,
-    int acc_on_ms, int acc_gap_ms)
-{
-    int n = WS2812_LED_NUM;
-    uint8_t *used = (uint8_t *)calloc(n + 1, 1);
-    if (!used) return;
+    function clamp(n, lo, hi){ return Math.max(lo, Math.min(hi, n)); }
 
-    mark_range_1based(used, 1, 24);
-    mark_range_1based(used, 70, 63);
-    mark_range_1based(used, 25, 40);
-    mark_range_1based(used, 78, 71);
-    mark_range_1based(used, 41, 51);
-    mark_range_1based(used, 86, 79);
+    // ====== Sliders live value ======
+    const bri = $("brightness");
+    const spd = $("speed");
+    const briVal = $("brightnessVal");
+    const spdVal = $("speedVal");
 
-    // PHA 1: riêng lẻ
-    led_strip_clear(strip);
-    set_range_1based(1, 24, r1, g1, b1);
-    set_range_1based(70, 63, r1, g1, b1);
-    led_strip_refresh(strip);
-    vTaskDelay(pdMS_TO_TICKS(solo_on_ms));
-    clear_show();
-    vTaskDelay(pdMS_TO_TICKS(solo_off_ms));
+    function syncVals(){
+      briVal.textContent = bri.value;
+      spdVal.textContent = spd.value;
+    }
+    bri.addEventListener("input", syncVals);
+    spd.addEventListener("input", syncVals);
+    syncVals();
 
-    led_strip_clear(strip);
-    set_range_1based(25, 40, r2, g2, b2);
-    set_range_1based(78, 71, r2, g2, b2);
-    led_strip_refresh(strip);
-    vTaskDelay(pdMS_TO_TICKS(solo_on_ms));
-    clear_show();
-    vTaskDelay(pdMS_TO_TICKS(solo_off_ms));
+    // ====== Color picker ======
+    const col = $("color");
+    const colVal = $("colorVal");
+    col.addEventListener("input", ()=> colVal.textContent = col.value);
+    colVal.textContent = col.value;
 
-    led_strip_clear(strip);
-    set_range_1based(41, 51, r3, g3, b3);
-    set_range_1based(86, 79, r3, g3, b3);
-    led_strip_refresh(strip);
-    vTaskDelay(pdMS_TO_TICKS(solo_on_ms));
-    clear_show();
-    vTaskDelay(pdMS_TO_TICKS(solo_off_ms));
+    function hexToRgb(hex){
+      hex = (hex||"").replace("#","");
+      return {
+        r: parseInt(hex.substring(0,2),16),
+        g: parseInt(hex.substring(2,4),16),
+        b: parseInt(hex.substring(4,6),16)
+      };
+    }
 
-    led_strip_clear(strip);
-    for (int i = 1; i <= n; i++) if (!used[i]) set_pixel(i - 1, r4, g4, b4);
-    led_strip_refresh(strip);
-    vTaskDelay(pdMS_TO_TICKS(solo_on_ms));
-    clear_show();
-    vTaskDelay(pdMS_TO_TICKS(solo_off_ms));
+    // ====== Firebase init ======
+    firebase.initializeApp(firebaseConfig);
+    const db = firebase.database();
+    const stateRef = db.ref("devices/esp32_01/state");
 
-    // PHA 2: cộng dồn giữ màu
-    led_strip_clear(strip);
+    // Disable nút cho đến khi login xong
+    applyBtn.disabled = true;
+    applyBtn.style.opacity = .7;
+    applyBtn.style.cursor = "not-allowed";
 
-    set_range_1based(1, 24, r1, g1, b1);
-    set_range_1based(70, 63, r1, g1, b1);
-    led_strip_refresh(strip);
-    vTaskDelay(pdMS_TO_TICKS(acc_on_ms));
-    if (acc_gap_ms > 0) vTaskDelay(pdMS_TO_TICKS(acc_gap_ms));
+    firebase.auth().signInAnonymously()
+      .then(() => {
+        setStatus("ok", "Firebase OK (Anonymous)");
+        applyBtn.disabled = false;
+        applyBtn.style.opacity = 1;
+        applyBtn.style.cursor = "pointer";
+        toast.textContent = "Đã đăng nhập ẩn danh. Bạn có thể APPLY.";
+      })
+      .catch((err) => {
+        console.error(err);
+        setStatus("bad", "Lỗi Auth: " + err.code);
+        toast.textContent = "Không đăng nhập được Anonymous. Hãy bật Anonymous trong Firebase Auth.";
+      });
 
-    set_range_1based(25, 40, r2, g2, b2);
-    set_range_1based(78, 71, r2, g2, b2);
-    led_strip_refresh(strip);
-    vTaskDelay(pdMS_TO_TICKS(acc_on_ms));
-    if (acc_gap_ms > 0) vTaskDelay(pdMS_TO_TICKS(acc_gap_ms));
+    // ====== Apply write (FULL SET) ======
+    async function updateState(){
+      try{
+        setStatus("warn", "Đang gửi lên Firebase…");
+        toast.textContent = "Đang ghi dữ liệu…";
 
-    set_range_1based(41, 51, r3, g3, b3);
-    set_range_1based(86, 79, r3, g3, b3);
-    led_strip_refresh(strip);
-    vTaskDelay(pdMS_TO_TICKS(acc_on_ms));
-    if (acc_gap_ms > 0) vTaskDelay(pdMS_TO_TICKS(acc_gap_ms));
+        const rgb = hexToRgb(col.value);
 
-    for (int i = 1; i <= n; i++) if (!used[i]) set_pixel(i - 1, r4, g4, b4);
-    led_strip_refresh(strip);
-    vTaskDelay(pdMS_TO_TICKS(acc_on_ms));
+        const payload = {
+          mode: Number($("mode").value),
+          brightness: Number(bri.value),
+          speed: Number(spd.value),
+          r: rgb.r,
+          g: rgb.g,
+          b: rgb.b
+        };
 
-    free(used);
-}
+        await stateRef.set(payload);
 
-// ===================== FIREBASE POLL TASK ======================
+        setStatus("ok", "Đã gửi thành công");
+        lastWrite.textContent = "OK • " + nowStr();
+        toast.textContent = "Đã gửi: " + JSON.stringify(payload);
+      }catch(err){
+        console.error(err);
+        setStatus("bad", "Gửi thất bại: " + (err.code || "error"));
+        lastWrite.textContent = "FAIL • " + nowStr();
+        toast.textContent = "Lỗi: " + (err.message || err);
+        alert("Firebase bị chặn quyền. Kiểm tra Realtime Database Rules (auth != null) và Auth Anonymous.");
+      }
+    }
+    applyBtn.addEventListener("click", updateState);
 
-static void firebase_poll_task(void *arg)
-{
+    // ====== Apply partial (VOICE) ======
+    async function applyPartial(payload){
+      await stateRef.update(payload);
+      lastWrite.textContent = "VOICE • " + nowStr();
+      toast.textContent = "VOICE gửi: " + JSON.stringify(payload);
+      setStatus("ok", "Đã gửi bằng giọng nói");
+    }
 
-    while (1) {
-      
-        esp_http_client_config_t cfg = {
-    .url = FIREBASE_URL,
-    .method = HTTP_METHOD_GET,
-    .crt_bundle_attach = esp_crt_bundle_attach,
-    .timeout_ms = 5000,
-};
+    function setUiFromPayload(p){
+      if (p.mode !== undefined) $("mode").value = String(p.mode);
+      if (p.brightness !== undefined) { bri.value = String(p.brightness); syncVals(); }
+      if (p.speed !== undefined) { spd.value = String(p.speed); syncVals(); }
+      if (p.colorHex !== undefined) { col.value = p.colorHex; colVal.textContent = p.colorHex; }
+    }
 
+    // =========================
+    // VOICE CONTROL (vi-VN)
+    // =========================
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
 
-        esp_http_client_handle_t client = esp_http_client_init(&cfg);
+    let recognizing = false;
+    let rec = null;
 
-esp_err_t err = esp_http_client_open(client, 0);
-if (err == ESP_OK) {
-    int content_len = esp_http_client_fetch_headers(client);
-    if (content_len < 0) content_len = 1024;
-    if (content_len > 2048) content_len = 2048;
+    function extractNumber(text){
+      const m = (text||"").match(/(-?\d+)/);
+      return m ? Number(m[1]) : null;
+    }
 
-    char *buf = (char *)calloc(1, content_len + 1);
-    int read_len = esp_http_client_read(client, buf, content_len);
+    function extractDelta(text){
+      const n = extractNumber(text);
+      if(n === null) return null;
+      const t = (text||"").toLowerCase();
+      if (t.includes("giảm") || t.includes("bot") || t.includes("xuong")) return -Math.abs(n);
+      if (t.includes("tăng") || t.includes("them") || t.includes("lên") || t.includes("len")) return Math.abs(n);
+      return null;
+    }
 
-    if (read_len > 0) {
-        cJSON *root = cJSON_Parse(buf);
-        if (root) {
-            cJSON *m = cJSON_GetObjectItem(root, "mode");
-            cJSON *b = cJSON_GetObjectItem(root, "brightness");
-            cJSON *s = cJSON_GetObjectItem(root, "speed");
+    function normalizeText(t){
+      return (t||"").toLowerCase()
+        .replaceAll("đ", "d")
+        .replace(/\s+/g, " ")
+        .trim();
+    }
 
-            if (cJSON_IsNumber(m)) {
-                int mv = m->valueint;
-                if (mv < 0) mv = 0;
-                if (mv > 5) mv = 5;
-                g_mode = (effect_mode_t)mv;
+    function hexFromText(text){
+      const m = (text||"").match(/#?[0-9a-f]{6}/i);
+      if(!m) return null;
+      let hx = m[0];
+      if(hx[0] !== "#") hx = "#"+hx;
+      return hx.toLowerCase();
+    }
+
+    function colorNameToHex(text){
+      const t = normalizeText(text);
+
+      const hx = hexFromText(t);
+      if(hx) return hx;
+
+      if (t.includes("do") || t.includes("red")) return "#ff0000";
+      if (t.includes("xanh duong") || t.includes("blue")) return "#0000ff";
+      if (t.includes("xanh la") || t.includes("green")) return "#00ff00";
+      if (t.includes("vang") || t.includes("yellow")) return "#ffff00";
+      if (t.includes("tim") || t.includes("purple")) return "#8000ff";
+      if (t.includes("hong") || t.includes("pink")) return "#ff2d95";
+      if (t.includes("trang") || t.includes("white")) return "#ffffff";
+      if (t.includes("cam") || t.includes("orange")) return "#ff7a00";
+      if (t.includes("xanh ngoc") || t.includes("cyan")) return "#00ffff";
+
+      return null;
+    }
+
+    async function startVoice(){
+      if(!SpeechRecognition){
+        alert("Trình duyệt không hỗ trợ nhận giọng nói. Hãy dùng Chrome trên PC/Android.");
+        return;
+      }
+      if (applyBtn.disabled){
+        alert("Chưa đăng nhập Firebase (Anonymous). Hãy bật Anonymous trong Firebase Auth rồi tải lại trang.");
+        return;
+      }
+
+      if(!rec){
+        rec = new SpeechRecognition();
+        rec.lang = "vi-VN";
+        rec.interimResults = false;
+        rec.continuous = false;
+
+        rec.onstart = () => {
+          recognizing = true;
+          voiceBtn.textContent = "🛑 ĐANG NGHE... (bấm để dừng)";
+          setStatus("warn", "Đang nghe giọng nói…");
+          toast.textContent = "Nói: 'chế độ 7', 'độ sáng 120', 'tốc độ 30', 'màu đỏ', 'màu #00ff88', 'tắt'...";
+        };
+
+        rec.onend = () => {
+          recognizing = false;
+          voiceBtn.textContent = "🎙 NÓI ĐỂ ĐIỀU KHIỂN";
+        };
+
+        rec.onerror = (e) => {
+          recognizing = false;
+          voiceBtn.textContent = "🎙 NÓI ĐỂ ĐIỀU KHIỂN";
+          setStatus("bad", "Voice error: " + e.error);
+          toast.textContent = "Lỗi voice: " + e.error + " (hãy cho phép mic / dùng Chrome)";
+          console.log("voice error", e);
+        };
+
+        rec.onresult = async (e) => {
+          const raw = e.results[0][0].transcript || "";
+          const text = normalizeText(raw);
+          console.log("VOICE:", text);
+          toast.textContent = "Bạn nói: " + raw;
+
+          try{
+            // OFF
+            if (text.includes("tat") || text.includes("off")) {
+              setUiFromPayload({mode:0});
+              await applyPartial({ mode: 0 });
+              return;
             }
-            if (cJSON_IsNumber(b)) {
-                int bv = b->valueint;
-                if (bv < 0) bv = 0;
-                if (bv > 255) bv = 255;
-                g_brightness = (uint8_t)bv;
-            }
-            if (cJSON_IsNumber(s)) {
-                int sv = s->valueint;
-                if (sv < 10) sv = 10;
-                if (sv > 200) sv = 200;
-                g_speed_ms = sv;
+
+            // ON
+            if (text.includes("bat") || text.includes("on")) {
+              const cur = Number($("mode").value);
+              const m = (cur === 0) ? 5 : cur;
+              setUiFromPayload({mode:m});
+              await applyPartial({ mode: m });
+              return;
             }
 
-            ESP_LOGI(TAG, "Firebase: mode=%d bri=%d speed=%d",
-                     (int)g_mode, (int)g_brightness, g_speed_ms);
+            // COLOR command
+            if (text.includes("mau") || text.includes("color")) {
+              const hex = colorNameToHex(text);
+              if (hex) {
+                const rgb = hexToRgb(hex);
+                // đổi mode 7 để thấy ngay
+                setUiFromPayload({mode:7, colorHex: hex});
+                await applyPartial({ mode: 7, r: rgb.r, g: rgb.g, b: rgb.b });
+                toast.textContent = "Đã đổi màu: " + hex + " (Mode 7)";
+                return;
+              }
+            }
 
-            cJSON_Delete(root);
-        } else {
-            ESP_LOGW(TAG, "Firebase JSON parse fail: %s", buf);
-        }
+            // MODE
+            if (text.includes("che do") || text.includes("mode")) {
+              const n = extractNumber(text);
+              if (n !== null){
+                const m = clamp(n, 0, 7);
+                setUiFromPayload({mode:m});
+                await applyPartial({ mode: m });
+                return;
+              }
+            }
+
+            // BRIGHTNESS
+            if (text.includes("do sang") || text.includes("sang") || text.includes("brightness")) {
+              const delta = extractDelta(text);
+              if (delta !== null){
+                const newB = clamp(Number(bri.value) + delta, 0, 255);
+                setUiFromPayload({brightness:newB});
+                await applyPartial({ brightness: newB });
+                return;
+              }
+              const n = extractNumber(text);
+              if (n !== null){
+                const newB = clamp(n, 0, 255);
+                setUiFromPayload({brightness:newB});
+                await applyPartial({ brightness: newB });
+                return;
+              }
+            }
+
+            // SPEED
+            if (text.includes("toc do") || text.includes("speed")) {
+              const delta = extractDelta(text);
+              if (delta !== null){
+                const newS = clamp(Number(spd.value) + delta, 10, 200);
+                setUiFromPayload({speed:newS});
+                await applyPartial({ speed: newS });
+                return;
+              }
+              const n = extractNumber(text);
+              if (n !== null){
+                const newS = clamp(n, 10, 200);
+                setUiFromPayload({speed:newS});
+                await applyPartial({ speed: newS });
+                return;
+              }
+            }
+
+            setStatus("warn", "Không hiểu lệnh");
+            toast.textContent = "Không hiểu. Thử: 'chế độ 7', 'độ sáng 120', 'tốc độ 30', 'màu đỏ', 'màu #00ff88', 'tắt'.";
+          }catch(err){
+            console.error(err);
+            setStatus("bad", "Voice gửi lỗi");
+            toast.textContent = "Voice gửi lỗi: " + (err.message || err);
+          }
+        };
+      }
+
+      if(!recognizing) rec.start();
+      else rec.stop();
     }
 
-    free(buf);
-    esp_http_client_close(client);
-} else {
-    ESP_LOGW(TAG, "Firebase HTTP open error: %s", esp_err_to_name(err));
-}
-
-esp_http_client_cleanup(client);
-vTaskDelay(pdMS_TO_TICKS(FIREBASE_POLL_MS));
-
-    }
-}
-
-
-// ===================== EFFECT TASK ======================
-static void effect_task(void *arg)
-{
-    while (1) {
-        switch (g_mode) {
-            case MODE_OFF:
-                clear_show();
-                vTaskDelay(pdMS_TO_TICKS(100));
-                break;
-
-            case MODE_LAYERS_PROGRESSIVE_WHITE:
-                effect_layers_progressive(255, 255, 255, 600, 150);
-                break;
-
-            case MODE_LAYERS_ONE_BY_ONE_GREEN:
-                effect_layers_one_by_one(0, 255, 0, 500, 150);
-                break;
-
-            case MODE_LAYERS_ONE_BY_ONE_MULTICOLOR:
-                effect_layers_one_by_one_multicolor(
-                    0, 255, 0,     // T1 xanh
-                    255, 0, 0,     // T2 đỏ
-                    255, 255, 0,   // T3 vàng
-                    0, 0, 255,     // T cuối xanh dương
-                    500, 150
-                );
-                break;
-
-            case MODE_LAYERS_SOLO_THEN_ACCUM:
-                effect_layers_solo_then_accumulate(
-                    0, 255, 0,     // T1
-                    255, 0, 0,     // T2
-                    255, 255, 0,   // T3
-                    0, 0, 255,     // T cuối
-                    250, 150,      // solo on/off
-                    400, 120       // accumulate on/gap
-                );
-                break;
-                
-            case MODE_ALL_COLOR_CYCLE:
-                effect_all_color_cycle();  // 30ms/step
-                break;
-
-            default:
-                vTaskDelay(pdMS_TO_TICKS(100));
-                break;
-        }
-    }
-}
-
-// ===================== WEB UI ======================
-static const char *INDEX_HTML =
-"<!doctype html><html><head>"
-"<meta name='viewport' content='width=device-width,initial-scale=1'>"
-"<style>"
-"body{font-family:Arial;padding:16px;max-width:520px;margin:auto}"
-"h2{margin:0 0 12px 0}"
-".card{border:1px solid #ddd;border-radius:14px;padding:14px;margin:12px 0;box-shadow:0 2px 8px rgba(0,0,0,.05)}"
-"label{display:block;margin:10px 0 6px;font-weight:600}"
-"select,button,input{width:100%;font-size:18px;padding:10px;border-radius:12px;border:1px solid #ccc}"
-"button{border:none;background:#111;color:#fff;font-weight:700}"
-".row{display:flex;gap:10px;align-items:center}"
-".row span{min-width:60px;text-align:right;font-weight:700}"
-".hint{color:#555;font-size:14px;margin-top:8px;line-height:1.4}"
-"</style>"
-"</head><body>"
-
-"<h2>ESP32 WS2812 Controller</h2>"
-
-"<div class='card'>"
-"<label for='m'>Effect</label>"
-"<select id='m'>"
-"<option value='0'>OFF</option>"
-"<option value='1'>Layers Progressive (White)</option>"
-"<option value='2'>Layers One by One (Green)</option>"
-"<option value='3'>Layers One by One (MultiColor)</option>"
-"<option value='4'>Layers Solo then Accumulate</option>"
-"<option value='5'>All LEDs Color Cycle</option>"
-"</select>"
-
-"<label>Brightness</label>"
-"<div class='row'>"
-"<input id='b' type='range' min='0' max='255' value='80' oninput='bv.textContent=this.value'>"
-"<span id='bv'>80</span>"
-"</div>"
-
-"<label>Speed (ms)</label>"
-"<div class='row'>"
-"<input id='s' type='range' min='10' max='200' value='30' oninput='sv.textContent=this.value'>"
-"<span id='sv'>30</span>"
-"</div>"
-
-"<button onclick='apply()'>APPLY</button>"
-"<div class='hint'>"
-"Tip: Speed áp dụng mạnh nhất cho hiệu ứng Color Cycle. Brightness giảm để đỡ sụt nguồn."
-"</div>"
-"</div>"
-
-"<script>"
-"function apply(){"
-"  var m=document.getElementById('m').value;"
-"  var b=document.getElementById('b').value;"
-"  var s=document.getElementById('s').value;"
-"  fetch('/set?m='+encodeURIComponent(m)+'&b='+encodeURIComponent(b)+'&s='+encodeURIComponent(s))"
-"    .then(r=>r.text())"
-"    .then(t=>console.log(t))"
-"    .catch(e=>console.log(e));"
-"}"
-"</script>"
-
-"</body></html>";
-
-
-static esp_err_t root_get_handler(httpd_req_t *req)
-{
-    httpd_resp_set_type(req, "text/html");
-    return httpd_resp_send(req, INDEX_HTML, HTTPD_RESP_USE_STRLEN);
-}
-
-static esp_err_t set_get_handler(httpd_req_t *req)
-{
-    char query[96];
-
-    if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
-        char m_str[8] = {0};
-        char b_str[8] = {0};
-        char s_str[8] = {0};
-
-        // mode
-        if (httpd_query_key_value(query, "m", m_str, sizeof(m_str)) == ESP_OK) {
-            int m = atoi(m_str);
-            if (m < 0) m = 0;
-            if (m > 5) m = 5;                 // ✅ giờ có mode 5
-            g_mode = (effect_mode_t)m;
-        }
-
-        // brightness
-        if (httpd_query_key_value(query, "b", b_str, sizeof(b_str)) == ESP_OK) {
-            int b = atoi(b_str);
-            if (b < 0) b = 0;
-            if (b > 255) b = 255;
-            g_brightness = (uint8_t)b;
-        }
-
-        // speed (ms)
-        if (httpd_query_key_value(query, "s", s_str, sizeof(s_str)) == ESP_OK) {
-            int s = atoi(s_str);
-            if (s < 10) s = 10;
-            if (s > 200) s = 200;
-            g_speed_ms = s;
-        }
-
-        ESP_LOGI(TAG, "Web set: mode=%d bright=%d speed=%dms", (int)g_mode, (int)g_brightness, g_speed_ms);
-    }
-
-    return httpd_resp_send(req, "OK", HTTPD_RESP_USE_STRLEN);
-}
-
-
-static httpd_handle_t start_webserver(void)
-{
-    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.stack_size = 4096;
-
-    httpd_handle_t server = NULL;
-    ESP_ERROR_CHECK(httpd_start(&server, &config));
-
-    httpd_uri_t uri_root = {
-        .uri = "/",
-        .method = HTTP_GET,
-        .handler = root_get_handler,
-        .user_ctx = NULL
-    };
-    httpd_register_uri_handler(server, &uri_root);
-
-    httpd_uri_t uri_set = {
-        .uri = "/set",
-        .method = HTTP_GET,
-        .handler = set_get_handler,
-        .user_ctx = NULL
-    };
-    httpd_register_uri_handler(server, &uri_set);
-
-    return server;
-}
-
-// ===================== WIFI (IN IP) ======================
-static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
-{
-    if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
-        esp_wifi_connect();
-    } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
-        ESP_LOGW(TAG, "WiFi disconnected, reconnecting...");
-        esp_wifi_connect();
-    }
-}
-
-static void ip_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
-{
-    if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
-        ip_event_got_ip_t *event = (ip_event_got_ip_t *)data;
-        ESP_LOGI(TAG, "Got IP: " IPSTR, IP2STR(&event->ip_info.ip));
-        ESP_LOGI(TAG, "Open browser: http://%d.%d.%d.%d/", IP2STR(&event->ip_info.ip));
-
-        // ✅ Start Firebase poll only after got IP (DNS OK)
-        if (g_firebase_task == NULL) {
-            xTaskCreate(firebase_poll_task, "firebase_poll", 6144, NULL, 4, &g_firebase_task);
-        }
-    }
-}
-
-
-static void wifi_init_sta(void)
-{
-    ESP_ERROR_CHECK(nvs_flash_init());
-    ESP_ERROR_CHECK(esp_netif_init());
-    ESP_ERROR_CHECK(esp_event_loop_create_default());
-    esp_netif_create_default_wifi_sta();
-
-    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
-
-    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL));
-    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &ip_event_handler, NULL));
-
-    wifi_config_t wifi_config = {0};
-    strncpy((char *)wifi_config.sta.ssid, WIFI_SSID, sizeof(wifi_config.sta.ssid));
-    strncpy((char *)wifi_config.sta.password, WIFI_PASS, sizeof(wifi_config.sta.password));
-
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
-    ESP_ERROR_CHECK(esp_wifi_start());
-
-    ESP_LOGI(TAG, "WiFi STA starting...");
-}
-
-// ===================== MAIN ======================
-void app_main(void)
-{
-    // LED init
-    led_strip_config_t strip_config = {
-        .strip_gpio_num = WS2812_GPIO,
-        .max_leds = WS2812_LED_NUM,
-        .led_model = LED_MODEL_WS2812,
-        .color_component_format = LED_STRIP_COLOR_COMPONENT_FMT_GRB,
-        .flags.invert_out = 0,
-    };
-
-    led_strip_rmt_config_t rmt_config = {
-        .clk_src = RMT_CLK_SRC_DEFAULT,
-        .resolution_hz = 10 * 1000 * 1000,
-        .mem_block_symbols = 64,
-        .flags.with_dma = 0,
-    };
-
-    ESP_ERROR_CHECK(led_strip_new_rmt_device(&strip_config, &rmt_config, &strip));
-    ESP_LOGI(TAG, "LED Ready: GPIO=%d, LEDs=%d", WS2812_GPIO, WS2812_LED_NUM);
-    clear_show();
-
-    // WiFi + Web
-    wifi_init_sta();
-    start_webserver();
-
-    // Effect task
-    xTaskCreate(effect_task, "effect_task", 4096, NULL, 5, &g_effect_task);
-    // Firebase poll task (đọc mode/brightness/speed từ RTDB)
-}
+    voiceBtn.addEventListener("click", startVoice);
+  </script>
+</body>
+</html>
