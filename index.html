@@ -1,0 +1,377 @@
+<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>ESP32 Firebase LED Control</title>
+  <style>
+    :root{
+      --bg:#0b1020;
+      --card:#121a33;
+      --card2:#0f1730;
+      --text:#eaf0ff;
+      --muted:#aab6da;
+      --line:rgba(255,255,255,.12);
+      --btn:#3b82f6;
+      --btn2:#2563eb;
+      --ok:#22c55e;
+      --warn:#f59e0b;
+      --bad:#ef4444;
+      --shadow: 0 18px 60px rgba(0,0,0,.45);
+      --r: 18px;
+    }
+    *{box-sizing:border-box}
+    body{
+      margin:0;
+      font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial;
+      background:
+        radial-gradient(1200px 600px at 10% 0%, rgba(59,130,246,.35), transparent 60%),
+        radial-gradient(900px 500px at 100% 20%, rgba(34,197,94,.25), transparent 55%),
+        radial-gradient(900px 500px at 50% 100%, rgba(245,158,11,.20), transparent 55%),
+        var(--bg);
+      color:var(--text);
+      min-height:100vh;
+      display:flex;
+      align-items:center;
+      justify-content:center;
+      padding:22px;
+    }
+    .wrap{width:min(720px, 100%);}
+
+    .top{
+      display:flex; gap:14px; align-items:center; justify-content:space-between;
+      margin-bottom:14px;
+    }
+    .brand{
+      display:flex; gap:12px; align-items:center;
+    }
+    .logo{
+      width:44px;height:44px;border-radius:14px;
+      background: linear-gradient(135deg, rgba(59,130,246,1), rgba(34,197,94,1));
+      box-shadow: var(--shadow);
+      position:relative;
+      overflow:hidden;
+    }
+    .logo:after{
+      content:"";
+      position:absolute; inset:-30px;
+      background: radial-gradient(circle at 30% 30%, rgba(255,255,255,.35), transparent 60%);
+      transform: rotate(25deg);
+    }
+    h1{
+      font-size:18px; margin:0;
+      letter-spacing:.2px;
+    }
+    .sub{color:var(--muted); font-size:13px; margin-top:2px}
+
+    .badge{
+      display:inline-flex; align-items:center; gap:8px;
+      padding:8px 10px; border-radius:999px;
+      border:1px solid var(--line);
+      background: rgba(255,255,255,.06);
+      font-size:12px;
+      color:var(--muted);
+      white-space:nowrap;
+    }
+    .dot{
+      width:10px;height:10px;border-radius:50%;
+      background: var(--warn);
+      box-shadow: 0 0 0 6px rgba(245,158,11,.14);
+    }
+    .dot.ok{background:var(--ok); box-shadow: 0 0 0 6px rgba(34,197,94,.12);}
+    .dot.bad{background:var(--bad); box-shadow: 0 0 0 6px rgba(239,68,68,.12);}
+
+    .card{
+      background: linear-gradient(180deg, rgba(255,255,255,.06), rgba(255,255,255,.03));
+      border:1px solid var(--line);
+      border-radius: var(--r);
+      box-shadow: var(--shadow);
+      overflow:hidden;
+    }
+    .grid{
+      display:grid;
+      grid-template-columns: 1fr 1fr;
+      gap:14px;
+      padding:16px;
+    }
+    @media (max-width: 640px){
+      .grid{grid-template-columns:1fr}
+    }
+    .section{
+      background: rgba(0,0,0,.18);
+      border:1px solid var(--line);
+      border-radius: 16px;
+      padding:14px;
+    }
+    .title{
+      display:flex; align-items:center; justify-content:space-between;
+      margin-bottom:10px;
+    }
+    .title b{font-size:14px}
+    .hint{color:var(--muted); font-size:12px}
+    .row{display:flex; gap:10px; align-items:center}
+    select, button, input[type="range"]{
+      width:100%;
+    }
+    select{
+      background: var(--card2);
+      color: var(--text);
+      border:1px solid var(--line);
+      padding:12px 12px;
+      border-radius: 14px;
+      font-size:15px;
+      outline:none;
+    }
+    input[type="range"]{
+      appearance:none;
+      height:10px;
+      border-radius:999px;
+      background: rgba(255,255,255,.12);
+      outline:none;
+    }
+    input[type="range"]::-webkit-slider-thumb{
+      appearance:none;
+      width:18px;height:18px;border-radius:50%;
+      background: var(--btn);
+      border:2px solid rgba(255,255,255,.35);
+      box-shadow: 0 8px 22px rgba(0,0,0,.35);
+    }
+    .value{
+      min-width:58px;
+      text-align:right;
+      font-variant-numeric: tabular-nums;
+      color: var(--text);
+      font-weight:700;
+    }
+
+    .actions{
+      padding:16px;
+      border-top:1px solid var(--line);
+      display:flex;
+      gap:12px;
+      align-items:center;
+      justify-content:space-between;
+      background: rgba(0,0,0,.14);
+      flex-wrap:wrap;
+    }
+    .btn{
+      flex:1;
+      min-width: 220px;
+      border:none;
+      border-radius: 16px;
+      padding:12px 14px;
+      font-size:15px;
+      font-weight:800;
+      color:white;
+      background: linear-gradient(135deg, var(--btn), var(--btn2));
+      cursor:pointer;
+      box-shadow: 0 18px 40px rgba(37,99,235,.28);
+      transition: transform .08s ease;
+    }
+    .btn:active{transform: translateY(1px)}
+    .mini{
+      display:flex; gap:10px; align-items:center;
+      color: var(--muted);
+      font-size:12px;
+      flex:1;
+      justify-content:flex-end;
+      min-width: 240px;
+    }
+    code{
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 11px;
+      padding:4px 8px;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: rgba(255,255,255,.06);
+      color: var(--text);
+    }
+    .toast{
+      margin-top:12px;
+      padding:10px 12px;
+      border-radius: 14px;
+      border:1px solid var(--line);
+      background: rgba(255,255,255,.06);
+      color: var(--muted);
+      font-size:12px;
+    }
+  </style>
+</head>
+
+<body>
+  <div class="wrap">
+    <div class="top">
+      <div class="brand">
+        <div class="logo"></div>
+        <div>
+          <h1>ESP32 WS2812 • Firebase Control</h1>
+          <div class="sub">Điều khiển LED từ mọi nơi (Firebase RTDB)</div>
+        </div>
+      </div>
+      <div class="badge" id="statusBadge">
+        <span class="dot" id="statusDot"></span>
+        <span id="statusText">Đang kết nối Firebase…</span>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="grid">
+        <div class="section">
+          <div class="title">
+            <b>Hiệu ứng</b>
+            <span class="hint">Mode</span>
+          </div>
+          <select id="mode">
+            <option value="0">OFF</option>
+            <option value="1">Layers Progressive (White)</option>
+            <option value="2">Layers One by One (Green)</option>
+            <option value="3">Layers One by One (MultiColor)</option>
+            <option value="4">Layers Solo then Accumulate</option>
+            <option value="5">All LEDs Color Cycle</option>
+          </select>
+
+          <div class="toast" style="margin-top:12px">
+            Path điều khiển: <code>devices/esp32_01/state</code>
+          </div>
+        </div>
+
+        <div class="section">
+          <div class="title">
+            <b>Độ sáng</b>
+            <span class="hint">0 → 255</span>
+          </div>
+          <div class="row">
+            <input id="brightness" type="range" min="0" max="255" value="80">
+            <div class="value" id="brightnessVal">80</div>
+          </div>
+
+          <div class="title" style="margin-top:14px">
+            <b>Tốc độ</b>
+            <span class="hint">ms/step</span>
+          </div>
+          <div class="row">
+            <input id="speed" type="range" min="10" max="200" value="30">
+            <div class="value" id="speedVal">30</div>
+          </div>
+
+          <div class="toast" id="toast">Mẹo: Speed ảnh hưởng mạnh nhất với “Color Cycle”.</div>
+        </div>
+      </div>
+
+      <div class="actions">
+        <button class="btn" id="applyBtn">APPLY → Firebase</button>
+        <div class="mini">
+          <span>Trạng thái:</span>
+          <code id="lastWrite">chưa gửi</code>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Firebase SDK (compat) -->
+  <script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-app-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-auth-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-database-compat.js"></script>
+
+  <script>
+    // ====== Config của bạn ======
+    const firebaseConfig = {
+      apiKey: "AIzaSyC7a8n72fv2IYXa0mCW8AVT1uySlDJ_fTg",
+      authDomain: "ledck-66e93.firebaseapp.com",
+      databaseURL: "https://ledck-66e93-default-rtdb.asia-southeast1.firebasedatabase.app",
+      projectId: "ledck-66e93",
+      storageBucket: "ledck-66e93.firebasestorage.app",
+      messagingSenderId: "374250268282",
+      appId: "1:374250268282:web:ff7f5d48745b692d4c3dc3",
+      measurementId: "G-Z9DZMK5LGR"
+    };
+
+    // ====== UI helpers ======
+    const $ = (id) => document.getElementById(id);
+    const statusDot = $("statusDot");
+    const statusText = $("statusText");
+    const toast = $("toast");
+    const lastWrite = $("lastWrite");
+    const applyBtn = $("applyBtn");
+
+    function setStatus(kind, text){
+      statusText.textContent = text;
+      statusDot.classList.remove("ok","bad");
+      if(kind === "ok") statusDot.classList.add("ok");
+      else if(kind === "bad") statusDot.classList.add("bad");
+      // warn = default
+    }
+
+    function nowStr(){
+      const d = new Date();
+      return d.toLocaleTimeString();
+    }
+
+    // ====== Sliders live value ======
+    const bri = $("brightness");
+    const spd = $("speed");
+    const briVal = $("brightnessVal");
+    const spdVal = $("speedVal");
+
+    function syncVals(){
+      briVal.textContent = bri.value;
+      spdVal.textContent = spd.value;
+    }
+    bri.addEventListener("input", syncVals);
+    spd.addEventListener("input", syncVals);
+    syncVals();
+
+    // ====== Firebase init ======
+    firebase.initializeApp(firebaseConfig);
+    const db = firebase.database();
+    const stateRef = db.ref("devices/esp32_01/state");
+
+    // Disable nút cho đến khi login xong
+    applyBtn.disabled = true;
+    applyBtn.style.opacity = .7;
+    applyBtn.style.cursor = "not-allowed";
+
+    firebase.auth().signInAnonymously()
+      .then(() => {
+        setStatus("ok", "Firebase OK (Anonymous)");
+        applyBtn.disabled = false;
+        applyBtn.style.opacity = 1;
+        applyBtn.style.cursor = "pointer";
+        toast.textContent = "Đã đăng nhập ẩn danh. Bạn có thể APPLY.";
+      })
+      .catch((err) => {
+        console.error(err);
+        setStatus("bad", "Lỗi Auth: " + err.code);
+        toast.textContent = "Không đăng nhập được Anonymous. Hãy bật Anonymous trong Firebase Auth.";
+      });
+
+    // ====== Apply write ======
+    async function updateState(){
+      try{
+        setStatus("warn", "Đang gửi lên Firebase…");
+        toast.textContent = "Đang ghi dữ liệu…";
+
+        const payload = {
+          mode: Number($("mode").value),
+          brightness: Number(bri.value),
+          speed: Number(spd.value)
+        };
+
+        await stateRef.set(payload);
+
+        setStatus("ok", "Đã gửi thành công");
+        lastWrite.textContent = "OK • " + nowStr();
+        toast.textContent = "Đã gửi: " + JSON.stringify(payload);
+      }catch(err){
+        console.error(err);
+        setStatus("bad", "Gửi thất bại: " + (err.code || "error"));
+        lastWrite.textContent = "FAIL • " + nowStr();
+        toast.textContent = "Lỗi: " + (err.message || err);
+        alert("Firebase bị chặn quyền. Kiểm tra Realtime Database Rules (auth != null) và Auth Anonymous.");
+      }
+    }
+
+    applyBtn.addEventListener("click", updateState);
+  </script>
+</body>
+</html>
