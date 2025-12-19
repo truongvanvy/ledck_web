@@ -372,6 +372,177 @@
     }
 
     applyBtn.addEventListener("click", updateState);
+    
+        // =========================
+    // VOICE CONTROL (vi-VN)
+    // =========================
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+
+    // Tạo nút Voice và thêm vào thanh actions
+    const voiceBtn = document.createElement("button");
+    voiceBtn.className = "btn";
+    voiceBtn.id = "voiceBtn";
+    voiceBtn.textContent = "🎙 NÓI ĐỂ ĐIỀU KHIỂN";
+    voiceBtn.style.background = "linear-gradient(135deg, #22c55e, #16a34a)";
+    document.querySelector(".actions").prepend(voiceBtn);
+
+    let recognizing = false;
+    let rec = null;
+
+    function clamp(n, lo, hi){ return Math.max(lo, Math.min(hi, n)); }
+
+    function extractNumber(text){
+      // lấy số đầu tiên trong câu
+      const m = text.match(/(-?\d+)/);
+      return m ? Number(m[1]) : null;
+    }
+
+    // ví dụ: "tăng sáng 20" => +20 ; "giảm tốc độ 10" => -10
+    function extractDelta(text){
+      const n = extractNumber(text);
+      if(n === null) return null;
+      if (text.includes("giảm") || text.includes("bớt") || text.includes("xuống")) return -Math.abs(n);
+      if (text.includes("tăng") || text.includes("thêm") || text.includes("lên")) return Math.abs(n);
+      return null;
+    }
+
+    async function applyPartial(payload){
+      // update Firebase + cập nhật UI cho đồng bộ
+      await stateRef.update(payload);
+      lastWrite.textContent = "VOICE • " + nowStr();
+      toast.textContent = "VOICE gửi: " + JSON.stringify(payload);
+      setStatus("ok", "Đã gửi bằng giọng nói");
+    }
+
+    function setUiFromPayload(p){
+      if (p.mode !== undefined) $("mode").value = String(p.mode);
+      if (p.brightness !== undefined) { bri.value = String(p.brightness); syncVals(); }
+      if (p.speed !== undefined) { spd.value = String(p.speed); syncVals(); }
+    }
+
+    function startVoice(){
+      if(!SpeechRecognition){
+        alert("Trình duyệt không hỗ trợ nhận giọng nói. Hãy dùng Chrome trên PC/Android.");
+        return;
+      }
+      if (applyBtn.disabled){
+        alert("Chưa đăng nhập Firebase (Anonymous). Hãy bật Anonymous trong Firebase Auth rồi tải lại trang.");
+        return;
+      }
+
+      if(!rec){
+        rec = new SpeechRecognition();
+        rec.lang = "vi-VN";
+        rec.interimResults = false;
+        rec.continuous = false;
+
+        rec.onstart = () => {
+          recognizing = true;
+          voiceBtn.textContent = "🛑 ĐANG NGHE... (bấm để dừng)";
+          setStatus("warn", "Đang nghe giọng nói…");
+          toast.textContent = "Hãy nói: 'chế độ 3', 'độ sáng 120', 'tốc độ 30', 'tắt'...";
+        };
+
+        rec.onend = () => {
+          recognizing = false;
+          voiceBtn.textContent = "🎙 NÓI ĐỂ ĐIỀU KHIỂN";
+          // không đổi status ở đây để giữ trạng thái Firebase
+        };
+
+        rec.onerror = (e) => {
+          recognizing = false;
+          voiceBtn.textContent = "🎙 NÓI ĐỂ ĐIỀU KHIỂN";
+          setStatus("bad", "Voice error: " + e.error);
+          toast.textContent = "Lỗi voice: " + e.error + " (hãy cho phép mic / dùng Chrome)";
+          console.log("voice error", e);
+        };
+
+        rec.onresult = async (e) => {
+          const raw = e.results[0][0].transcript || "";
+          const text = raw.toLowerCase().trim();
+          console.log("VOICE:", text);
+          toast.textContent = "Bạn nói: " + raw;
+
+          try{
+            // Lệnh cơ bản: tắt / bật
+            if (text.includes("tắt") || text.includes("off")) {
+              setUiFromPayload({mode:0});
+              await applyPartial({ mode: 0 });
+              return;
+            }
+            if (text.includes("bật") || text.includes("on")) {
+              // “bật” -> mode hiện tại nếu đang OFF thì chuyển sang 5 (Color Cycle) cho dễ thấy
+              const cur = Number($("mode").value);
+              const m = (cur === 0) ? 5 : cur;
+              setUiFromPayload({mode:m});
+              await applyPartial({ mode: m });
+              return;
+            }
+
+            // “chế độ/mode X”
+            if (text.includes("chế độ") || text.includes("che do") || text.includes("mode")) {
+              const n = extractNumber(text);
+              if (n !== null){
+                const m = clamp(n, 0, 5);
+                setUiFromPayload({mode:m});
+                await applyPartial({ mode: m });
+                return;
+              }
+            }
+
+            // Độ sáng: “độ sáng 120”, “sáng 120”
+            if (text.includes("độ sáng") || text.includes("do sang") || text.includes("sáng") || text.includes("brightness")) {
+              const delta = extractDelta(text);
+              if (delta !== null){
+                const newB = clamp(Number(bri.value) + delta, 0, 255);
+                setUiFromPayload({brightness:newB});
+                await applyPartial({ brightness: newB });
+                return;
+              }
+              const n = extractNumber(text);
+              if (n !== null){
+                const newB = clamp(n, 0, 255);
+                setUiFromPayload({brightness:newB});
+                await applyPartial({ brightness: newB });
+                return;
+              }
+            }
+
+            // Tốc độ: “tốc độ 30”, “speed 30”
+            if (text.includes("tốc độ") || text.includes("toc do") || text.includes("speed")) {
+              const delta = extractDelta(text);
+              if (delta !== null){
+                const newS = clamp(Number(spd.value) + delta, 10, 200);
+                setUiFromPayload({speed:newS});
+                await applyPartial({ speed: newS });
+                return;
+              }
+              const n = extractNumber(text);
+              if (n !== null){
+                const newS = clamp(n, 10, 200);
+                setUiFromPayload({speed:newS});
+                await applyPartial({ speed: newS });
+                return;
+              }
+            }
+
+            // Nếu không hiểu
+            setStatus("warn", "Không hiểu lệnh");
+            toast.textContent = "Không hiểu. Thử: 'chế độ 3', 'độ sáng 120', 'tốc độ 30', 'tắt'.";
+          }catch(err){
+            console.error(err);
+            setStatus("bad", "Voice gửi lỗi");
+            toast.textContent = "Voice gửi lỗi: " + (err.message || err);
+          }
+        };
+      }
+
+      if(!recognizing) rec.start();
+      else rec.stop();
+    }
+
+    voiceBtn.addEventListener("click", startVoice);
+
   </script>
 </body>
 </html>
