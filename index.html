@@ -244,6 +244,9 @@
             <option value="5">All LEDs Color Cycle</option>
             <option value="6">Mode 6: 4 LEDs Fade Blink</option>
             <option value="7">Mode 7: All Breathing (Fade In/Out)</option>
+            <option value="8">Mode 8: LED 1_62 Solid, Others Rainbow</option>
+            <option value="9">Mode 9: LED 1_62 Shift 2 Step, Others Rainbow</option>
+            <option value="10">Mode 10: Run 63_96, Others Solid</option>
           </select>
 
           <div class="toast" style="margin-top:12px">
@@ -574,12 +577,31 @@
             if (text.includes("che do") || text.includes("mode")) {
               const n = extractNumber(text);
               if (n !== null){
-                const m = clamp(n, 0, 7);
+                const m = clamp(n, 0, 10);
                 setUiFromPayload({mode:m});
                 await applyPartial({ mode: m });
                 return;
               }
             }
+
+            // ===== MODE THEO TÊN =====
+if (text.includes("dich bit thẳng") || text.includes("thanh tron giu nguyen mau")|| text.includes("mode 10")) {
+  setUiFromPayload({mode:10});
+  await applyPartial({ mode: 10 });
+  return;
+}
+
+if (text.includes("doi mau thanh thang") || text.includes("thanh tron giu nguyen mau") || text.includes("mode 8")) {
+  setUiFromPayload({mode:8});
+  await applyPartial({ mode: 8 });
+  return;
+}
+
+if (text.includes("dich bit tròn") || text.includes("dich 2 bit")|| text.includes("mode 9")) {
+  setUiFromPayload({mode:9});
+  await applyPartial({ mode: 9 });
+  return;
+}
 
             // BRIGHTNESS
             if (text.includes("do sang") || text.includes("sang") || text.includes("brightness")) {
