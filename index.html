@@ -585,19 +585,19 @@
             }
 
             // ===== MODE THEO TÊN =====
-if (text.includes("dich bit thẳng") || text.includes("thanh tron giu nguyen mau")|| text.includes("mode 10")) {
+if (text.includes("dich bit thang") || text.includes("mua roi")|| text.includes("mode 10")) {
   setUiFromPayload({mode:10});
   await applyPartial({ mode: 10 });
   return;
 }
 
-if (text.includes("doi mau thanh thang") || text.includes("thanh tron giu nguyen mau") || text.includes("mode 8")) {
+if (text.includes("doi mau thanh thang") || text.includes("bay ba") || text.includes("mode 8")) {
   setUiFromPayload({mode:8});
   await applyPartial({ mode: 8 });
   return;
 }
 
-if (text.includes("dich bit tròn") || text.includes("dich 2 bit")|| text.includes("mode 9")) {
+if (text.includes("dich bit tron") || text.includes("mu loa")|| text.includes("mode 9")) {
   setUiFromPayload({mode:9});
   await applyPartial({ mode: 9 });
   return;
